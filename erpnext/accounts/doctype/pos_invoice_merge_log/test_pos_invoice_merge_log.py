@@ -99,6 +99,210 @@ class TestPOSInvoiceMergeLog(ERPNextTestSuite):
 		closing_entry.insert().submit()
 		return closing_entry
 
+	def restrict_user_to_pos(self):
+		# A cashier can close and update POS invoices without access to Sales Invoice.
+		with self.set_user("Administrator"):
+			self.test_user.set(
+				"roles", [{"role": "Sales Manager"}, {"role": "Sales User"}, {"role": "Stock User"}]
+			)
+			self.test_user.save()
+			for permission in ("read", "write", "create", "submit"):
+				frappe.permissions.update_permission_property(
+					"POS Invoice", "Sales Manager", 0, permission, 1
+				)
+			frappe.permissions.update_permission_property("POS Profile", "Sales Manager", 0, "read", 1)
+		frappe.clear_cache(user=self.test_user.name)
+		frappe.clear_cache(doctype="POS Invoice")
+		frappe.clear_cache(doctype="POS Profile")
+		self.addCleanup(frappe.clear_cache, user=self.test_user.name)
+		self.addCleanup(frappe.clear_cache, doctype="POS Invoice")
+		self.addCleanup(frappe.clear_cache, doctype="POS Profile")
+		self.assertTrue(frappe.has_permission("POS Closing Entry", "submit"))
+		self.assertFalse(frappe.has_permission("Sales Invoice", "create"))
+		self.assertFalse(frappe.has_permission("Sales Invoice", "submit"))
+
+	def test_closing_inherits_merge_log_permissions_for_sales(self):
+		sale = sell_over_the_counter([("_Test Item", 1, 300)])
+		closing_entry = make_closing_entry_from_opening(self.opening_entry)
+		self.restrict_user_to_pos()
+
+		closing_entry.insert().submit()
+
+		self.assertEqual(closing_entry.reload().status, "Submitted")
+		self.assertEqual(sale.reload().status, "Consolidated")
+		self.assertEqual(frappe.db.get_value("Sales Invoice", sale.consolidated_invoice, "docstatus"), 1)
+
+	def test_closing_inherits_merge_log_permissions_for_credit_notes(self):
+		sale = sell_over_the_counter([("_Test Item", 1, 300)])
+		merge_log = frappe.new_doc("POS Invoice Merge Log")
+		merge_log.customer = sale.customer
+		merge_log.process_merging_into_sales_invoice([sale])
+		sale.db_set("consolidated_invoice", merge_log.consolidated_invoice)
+		sale.set_status(update=True)
+		note = refund_over_the_counter(sale)
+		closing_entry = make_closing_entry_from_opening(self.opening_entry)
+		self.restrict_user_to_pos()
+
+		closing_entry.insert().submit()
+
+		self.assertEqual(closing_entry.reload().status, "Submitted")
+		self.assertEqual(note.reload().status, "Consolidated")
+		self.assertEqual(frappe.db.get_value("Sales Invoice", note.consolidated_invoice, "docstatus"), 1)
+		self.assertEqual(frappe.db.get_value("Sales Invoice", note.consolidated_invoice, "is_return"), 1)
+
+	def test_manual_merge_log_keeps_sales_invoice_permission_checks(self):
+		sale = sell_over_the_counter([("_Test Item", 1, 300)])
+		note = refund_over_the_counter(sale)
+		self.restrict_user_to_pos()
+
+		for pos_invoice in (sale, note):
+			with self.subTest(is_return=pos_invoice.is_return):
+				merge_log = frappe.new_doc("POS Invoice Merge Log")
+				merge_log.customer = pos_invoice.customer
+				merge_log.posting_date = pos_invoice.posting_date
+				merge_log.posting_time = pos_invoice.posting_time
+				with self.assertRaises(frappe.PermissionError):
+					if pos_invoice.is_return:
+						merge_log.process_merging_into_credit_notes({None: [pos_invoice]})
+					else:
+						merge_log.process_merging_into_sales_invoice([pos_invoice])
+				self.assertIn("Sales Invoice", frappe.message_log[-1]["message"])
+
+	def make_zero_precision_inclusive_invoice(
+		self, rates, cash, is_return=0, tax_account="_Test Account VAT - _TC"
+	):
+		invoice = create_pos_invoice(do_not_save=True, is_return=is_return)
+		invoice.set("items", [])
+		for rate in rates:
+			invoice.append(
+				"items",
+				{
+					"item_code": "_Test Item",
+					"qty": -1 if is_return else 1,
+					"rate": rate,
+					"warehouse": "_Test Warehouse - _TC",
+					"income_account": "Sales - _TC",
+					"cost_center": "_Test Cost Center - _TC",
+				},
+			)
+		invoice.append(
+			"taxes",
+			{
+				"account_head": tax_account,
+				"charge_type": "On Net Total",
+				"cost_center": "_Test Cost Center - _TC",
+				"description": "VAT",
+				"rate": 18,
+				"included_in_print_rate": 1,
+			},
+		)
+		invoice.set("payments", [{"mode_of_payment": "Cash", "account": "Cash - _TC", "amount": cash}])
+		invoice.paid_amount = invoice.base_paid_amount = cash
+		invoice.insert().submit()
+		return invoice
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_zero_precision_inclusive_tax_preserves_total_and_cash(self):
+		invoice = self.make_zero_precision_inclusive_invoice([12000, 7000, 15000], 40000)
+		self.assertEqual(invoice.net_total, 28813)
+		self.assertEqual(invoice.total_taxes_and_charges, 5186)
+		self.assertEqual(invoice.grand_total, 34000)
+		self.assertEqual(invoice.change_amount, 6000)
+
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", invoice.reload().consolidated_invoice)
+		self.assertEqual(consolidated.grand_total, 34000)
+		self.assertEqual(consolidated.base_grand_total, 34000)
+		self.assertEqual(consolidated.change_amount, 6000)
+		self.assertEqual(consolidated.outstanding_amount, 0)
+		cash_entries = frappe.get_all(
+			"GL Entry",
+			filters={
+				"voucher_type": "Sales Invoice",
+				"voucher_no": consolidated.name,
+				"account": "Cash - _TC",
+			},
+			fields=["debit", "credit"],
+		)
+		self.assertEqual(sum(row.debit - row.credit for row in cash_entries), 34000)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_zero_precision_inclusive_tax_accumulates_each_invoice_difference(self):
+		invoices = [self.make_zero_precision_inclusive_invoice([12000, 7000, 15000], 34000) for _ in range(2)]
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", invoices[0].reload().consolidated_invoice)
+		self.assertEqual(invoices[1].reload().consolidated_invoice, consolidated.name)
+		self.assertEqual(consolidated.grand_total, 68000)
+		self.assertEqual(consolidated.base_grand_total, 68000)
+		self.assertEqual(consolidated.change_amount, 0)
+		self.assertEqual(consolidated.outstanding_amount, 0)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_zero_precision_inclusive_tax_preserves_credit_note_total(self):
+		note = self.make_zero_precision_inclusive_invoice([12000, 7000, 15000], -34000, is_return=1)
+		self.assertEqual(note.grand_total, -34000)
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", note.reload().consolidated_invoice)
+		self.assertEqual(consolidated.grand_total, -34000)
+		self.assertEqual(consolidated.base_grand_total, -34000)
+		self.assertEqual(consolidated.outstanding_amount, 0)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	def test_zero_precision_inclusive_tax_without_difference(self):
+		invoice = self.make_zero_precision_inclusive_invoice([11800], 11800)
+		self.assertEqual(invoice.net_total, 10000)
+		self.assertEqual(invoice.total_taxes_and_charges, 1800)
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", invoice.reload().consolidated_invoice)
+		self.assertEqual(consolidated.grand_total, 11800)
+		self.assertEqual(consolidated.total_taxes_and_charges, 1800)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_inclusive_tax_difference_follows_each_source_tax_account(self):
+		invoices = [
+			self.make_zero_precision_inclusive_invoice([12000, 7000, 15000], 34000, tax_account=account)
+			for account in (
+				"_Test Account VAT - _TC",
+				"_Test Account Excise Duty - _TC",
+				"_Test Account VAT - _TC",
+			)
+		]
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", invoices[0].reload().consolidated_invoice)
+		self.assertEqual(consolidated.grand_total, 102000)
+		self.assertEqual(
+			{tax.account_head: tax.tax_amount for tax in consolidated.taxes},
+			{"_Test Account VAT - _TC": 10374, "_Test Account Excise Duty - _TC": 5187},
+		)
+		for tax in consolidated.taxes:
+			self.assertEqual(
+				sum(row.amount for row in consolidated.item_wise_tax_details if row.tax_row == tax.name),
+				tax.base_tax_amount_after_discount_amount,
+			)
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": "0"})
+	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_zero_precision_inclusive_tax_preserves_negative_difference(self):
+		invoice = self.make_zero_precision_inclusive_invoice([15, 15, 15], 45)
+		self.assertEqual(invoice.net_total, 39)
+		self.assertEqual(invoice.total_taxes_and_charges, 7)
+		self.assertEqual(invoice.grand_total, 45)
+		self.make_closing_entry()
+
+		consolidated = frappe.get_doc("Sales Invoice", invoice.reload().consolidated_invoice)
+		self.assertEqual(consolidated.grand_total, 45)
+		self.assertEqual(consolidated.change_amount, 0)
+		self.assertEqual(consolidated.outstanding_amount, 0)
+
 	def test_consolidated_invoice_creation(self):
 		pos_inv = create_pos_invoice(rate=300, do_not_submit=1)
 		pos_inv.append("payments", {"mode_of_payment": "Cash", "account": "Cash - _TC", "amount": 300})
@@ -401,7 +605,10 @@ class TestPOSInvoiceMergeLog(ERPNextTestSuite):
 		inv.load_from_db()
 		consolidated_invoice = frappe.get_doc("Sales Invoice", inv.consolidated_invoice)
 		self.assertEqual(consolidated_invoice.status, "Return")
-		self.assertEqual(consolidated_invoice.rounding_adjustment, -0.002)
+		# The inclusive-tax difference is part of grand_total, not rounded_total.
+		self.assertEqual(consolidated_invoice.grand_total, -314)
+		self.assertEqual(consolidated_invoice.rounded_total, -314)
+		self.assertEqual(consolidated_invoice.rounding_adjustment, 0)
 
 	def test_consolidation_rounding_adjustment(self):
 		"""
