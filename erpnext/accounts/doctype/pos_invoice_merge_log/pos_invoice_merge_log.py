@@ -289,6 +289,7 @@ class POSInvoiceMergeLog(Document):
 			base_rounding_adjustment += doc.base_rounding_adjustment
 			base_rounded_total += doc.base_rounded_total
 
+			detail_start = len(item_tax_details)
 			for d in doc.get("item_wise_tax_details") or []:
 				row = frappe._dict(
 					item=old_new_item_map[d.item_row],
@@ -298,6 +299,25 @@ class POSInvoiceMergeLog(Document):
 					taxable_amount=d.taxable_amount,
 				)
 				item_tax_details.append(row)
+
+			if doc.get("taxes"):
+				# Converting inclusive taxes to Actual loses the calculator's grand_total_diff.
+				diff = flt(
+					doc.grand_total - doc.net_total - doc.total_taxes_and_charges,
+					doc.precision("grand_total"),
+				)
+				base_diff = flt(
+					doc.base_grand_total - doc.base_net_total - doc.base_total_taxes_and_charges,
+					doc.precision("base_grand_total"),
+				)
+				if diff or base_diff:
+					last_tax = old_new_tax_map[doc.taxes[-1].name]
+					last_tax.tax_amount = flt(last_tax.tax_amount) + diff
+					last_tax.base_tax_amount = flt(last_tax.base_tax_amount) + base_diff
+					for row in reversed(item_tax_details[detail_start:]):
+						if row.tax is last_tax:
+							row.amount = flt(row.amount) + base_diff
+							break
 
 		if loyalty_points_sum:
 			invoice.redeem_loyalty_points = 1
@@ -366,6 +386,7 @@ class POSInvoiceMergeLog(Document):
 
 	def get_new_sales_invoice(self):
 		sales_invoice = frappe.new_doc("Sales Invoice")
+		sales_invoice.flags.ignore_permissions = self.flags.ignore_permissions
 		sales_invoice.customer = self.customer
 		sales_invoice.is_pos = 1
 		sales_invoice.posting_date = None
